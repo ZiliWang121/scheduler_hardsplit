@@ -198,11 +198,10 @@ static struct sk_buff *mptcp_reles_next_segment(struct sock *meta_sk,
 	struct mptcp_tcp_sock *mptcp;
 	struct sock *choose_sk = NULL;
 	struct sk_buff *skb = __mptcp_reles_next_segment(meta_sk, reinject);
-	unsigned char split = 1,max_space=0;    //difference to rr!
+	unsigned char split = 1;
 	unsigned char iter = 0, full_subs = 0;
 
-	/* As we set it, we have to reset it as well. */
-	*limit = 0;
+	*limit = 0; // 初始化 limit
 
 	if (!skb)
 		return NULL;
@@ -211,57 +210,41 @@ static struct sk_buff *mptcp_reles_next_segment(struct sock *meta_sk,
 		*subsk = reles_get_available_subflow(meta_sk, skb, false);
 		if (!*subsk)
 			return NULL;
-
 		return skb;
 	}
 
 retry:
-  choose_sk = NULL;
-  split = 0;
-  iter = 0; 
-  full_subs = 0; 
-	/* First, we look for a subflow who is currently being used */
+	choose_sk = NULL;
+	split = 0;
+	iter = 0;
+	full_subs = 0;
+
+	// 🟢 RoundRobin 逻辑：找到 quota 没满的第一个子流
 	mptcp_for_each_sub(mpcb, mptcp) {
-	        
 		struct sock *sk_it = mptcp_to_sock(mptcp);
 		struct tcp_sock *tp_it = tcp_sk(sk_it);
 		struct mysched_priv *msp = mysched_get_priv(tp_it);
-		
+
 		if (!mptcp_reles_is_available(sk_it, skb, false, cwnd_limited))
 			continue;
-		//skip subfows with num_segments = 0	
-		if(msp->num_segments == 0){
+
+		if (msp->num_segments == 0)
 			continue;
-		}	
 
 		iter++;
-		
-		
-		/* Is this subflow currently being used? */
-		if ((msp->quota >= 0) && (msp->quota < msp->num_segments) &&
-      (msp->num_segments - msp->quota > split)) {
+
+		if (msp->quota < msp->num_segments) {
+			choose_sk = sk_it;
 			split = msp->num_segments - msp->quota;
-			if(max_space < split){
-				choose_sk = sk_it; 
-				max_space = split;
-			}
+			break;  // 找到第一个就发（轮流公平）
 		}
-		
-		/* Or, it must then be fully used  */
+
 		if (msp->quota >= msp->num_segments)
 			full_subs++;
 	}
 
-  if (choose_sk != NULL) //changed so that we now only go to found if we actually found a subflow
-    goto found;
-	/* All considered subflows have a full quota, and we considered at
-	 * least one.
-	 * For ReLes only reset if quota of both paths is filled ?
-	 */
-	if (iter && (iter == full_subs)) {
-		/* So, we restart this round by setting quota to 0 and retry
-		 * to find a subflow.
-		 */
+	// 🔁 所有路径 quota 都满了，重置并重试
+	if (!choose_sk && iter && iter == full_subs) {
 		mptcp_for_each_sub(mpcb, mptcp) {
 			struct sock *sk_it = mptcp_to_sock(mptcp);
 			struct tcp_sock *tp_it = tcp_sk(sk_it);
@@ -269,14 +252,13 @@ retry:
 
 			if (!mptcp_reles_is_available(sk_it, skb, false, cwnd_limited))
 				continue;
-			msp->quota = 0;
-			
-		}
 
+			msp->quota = 0;
+		}
 		goto retry;
 	}
 
-found:
+	// ✅ 找到了可用路径，返回 skb
 	if (choose_sk) {
 		unsigned int mss_now;
 		struct tcp_sock *choose_tp = tcp_sk(choose_sk);
@@ -284,14 +266,12 @@ found:
 
 		if (!mptcp_reles_is_available(choose_sk, skb, false, true))
 			return NULL;
-			
-		if(choose_sk!=NULL)
-			pr_info("%d",choose_sk->__sk_common.skc_daddr);		
-		
+
 		*subsk = choose_sk;
 		mss_now = tcp_current_mss(*subsk);
 		*limit = split * mss_now;
 
+		// ✏️ 更新 quota（注意 mss 对齐）
 		if (skb->len > mss_now)
 			msp->quota += DIV_ROUND_UP(skb->len, mss_now);
 		else
